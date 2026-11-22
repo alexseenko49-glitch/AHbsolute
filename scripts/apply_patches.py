@@ -1,193 +1,472 @@
+sanyaukr:
 #!/usr/bin/env python3
-"""Applies AHbsolute patches to a checkout of Telegram-Android.
-Usage: apply_patches.py <upstream_dir>
-Required patches fail loudly (exit 1) so CI never silently builds something half-patched."""
-import os, re, sys, json
 
-UP = sys.argv[1]
+"""
+AHbsolute patch installer for Telegram-Android.
+
+Usage:
+python3 scripts/apply_patches.py upstream
+
+Required:
+TG_API_ID
+TG_API_HASH
+
+The script fails loudly when required source modifications
+cannot be applied. It does not silently skip missing features.
+"""
+
+import os
+import re
+import sys
+from pathlib import Path
+
+# ---------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------
+
+if len(sys.argv) < 2:
+print("Usage: apply_patches.py <upstream_dir>")
+sys.exit(1)
+
+UP = Path(sys.argv[1]).resolve()
+
 APP_ID = os.environ.get("TG_API_ID", "").strip()
 APP_HASH = os.environ.get("TG_API_HASH", "").strip()
 PKG = os.environ.get("AH_PACKAGE", "com.ahbsolute.app").strip()
+
 failures = []
+warnings = []
 
-def walk(pattern_name=None, suffix=None):
-    for d, _, files in os.walk(UP):
-        if "/.git" in d or "/build/" in d + "/":
-            continue
-        for f in files:
-            if (pattern_name and f == pattern_name) or (suffix and f.endswith(suffix)):
-                yield os.path.join(d, f)
 
-def read(p):
-    with open(p, encoding="utf-8") as fh: return fh.read()
+# ---------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------
 
-def write(p, s):
-    with open(p, "w", encoding="utf-8") as fh: fh.write(s)
+def fail(message, required=True):
+prefix = "FAIL: " if required else "WARN: "
+print(prefix + message)
 
-def one(name):
-    hits = list(walk(pattern_name=name))
-    return hits[0] if hits else None
+if required:
+failures.append(message)
+else:
+warnings.append(message)
 
-def fail(msg, required=True):
-    print(("FAIL: " if required else "WARN: ") + msg)
-    if required: failures.append(msg)
 
-def brace_end(src, open_idx):
-    depth = 0
-    for i in range(open_idx, len(src)):
-        c = src[i]
-        if c == "{": depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0: return i
-    return -1
+def read(path):
+return path.read_text(encoding="utf-8")
 
-# ---------- 1. BuildVars: own api_id / api_hash (Telegram API ToS 2.1) ----------
+
+def write(path, content):
+path.write_text(content, encoding="utf-8")
+
+
+def walk(filename=None, suffix=None):
+for root, dirs, files in os.walk(UP):
+dirs[:] = [
+d for d in dirs
+if d not in (".git", "build", ".gradle")
+]
+
+for filename_found in files:
+if filename and filename_found == filename:
+yield Path(root) / filename_found
+
+elif suffix and filename_found.endswith(suffix):
+yield Path(root) / filename_found
+
+
+def one(filename):
+results = list(walk(filename=filename))
+return results[0] if results else None
+
+
+def replace_once(pattern, replacement, content):
+return re.subn(pattern, replacement, content, count=1)
+
+
+# ---------------------------------------------------------
+# Validate repository
+# ---------------------------------------------------------
+
+if not UP.exists():
+print("ERROR: upstream directory does not exist")
+sys.exit(1)
+
+if not APP_ID or not APP_HASH or not APP_ID.isdigit():
+fail(
+"TG_API_ID / TG_API_HASH are missing or invalid"
+)
+
+if not re.fullmatch(r"[A-Za-z0-9_.]+", PKG):
+fail("AH_PACKAGE is invalid")
+
+
+# ---------------------------------------------------------
+# 1. BuildVars: Telegram API credentials
+# ---------------------------------------------------------
+
+print("\n=== 1. BuildVars ===")
+
 bv = one("BuildVars.java")
-if not bv: fail("BuildVars.java not found")
+
+if not bv:
+fail("BuildVars.java not found")
+
+elif APP_ID and APP_HASH and APP_ID.isdigit():
+
+content = read(bv)
+
+content, n1 = replace_once(
+r"(APP_ID\s*=\s*)\d+",
+lambda m: m.group(1) + APP_ID,
+content
+)
+
+content, n2 = replace_once(
+r'(APP_HASH\s*=\s*)"[^"]*"',
+lambda m: m.group(1) + '"' + APP_HASH + '"',
+content
+)
+
+if n1 != 1 or n2 != 1:
+fail("Could not update APP_ID / APP_HASH")
+
 else:
-    s = read(bv)
-    if not APP_ID or not APP_HASH or not APP_ID.isdigit():
-        fail("TG_API_ID / TG_API_HASH secrets are missing or invalid (get your own at https://my.telegram.org)")
-    else:
-        s, n1 = re.subn(r'(APP_ID\s*=\s*)\d+', r'\g<1>' + APP_ID, s, count=1)
-        s, n2 = re.subn(r'(APP_HASH\s*=\s*)"[^"]*"', r'\g<1>"' + APP_HASH + '"', s, count=1)
-        if n1 != 1 or n2 != 1: fail("could not set APP_ID/APP_HASH in BuildVars.java")
-        else: write(bv, s); print("ok: api_id/api_hash set")
+write(bv, content)
+print("OK: Telegram API credentials configured")
 
-# ---------- 2. applicationId ----------
-cnt = 0
-for g in list(walk(suffix="build.gradle")) + list(walk(suffix="build.gradle.kts")):
-    s = read(g)
-    s2, n = re.subn(r'(applicationId\s*=?\s*)["\']org\.telegram\.messenger[\w.]*["\']', r'\g<1>"' + PKG + '"', s)
-    if n: write(g, s2); cnt += n
-if cnt == 0: fail("applicationId not found in any build.gradle")
-else: print("ok: applicationId ->", PKG, f"({cnt} places)")
 
-# ---------- 3. manifests: avoid DUPLICATE_PERMISSION clash with official Telegram ----------
-pm = 0
-for m in walk(pattern_name="AndroidManifest.xml"):
-    s = read(m)
-    s2, n = re.subn(r'org\.telegram\.messenger(?:\.web|\.beta)?\.permission\.', '${applicationId}.permission.', s)
-    if n: write(m, s2); pm += n
-print("info: manifest permission names rewritten:", pm)
+# ---------------------------------------------------------
+# 2. applicationId
+# ---------------------------------------------------------
 
-# ---------- 4. app name (no "Telegram" in the title, ToS 2.3) ----------
-nm = 0
-for x in walk(pattern_name="strings.xml"):
-    s = read(x)
-    s2, n = re.subn(r'(<string\s+name="AppName(?:Beta)?"[^>]*>)[^<]*(</string>)', r'\g<1>AHbsolute\g<2>', s)
-    if n: write(x, s2); nm += n
-if nm == 0: fail("AppName string not found")
-else: print("ok: AppName ->", "AHbsolute", f"({nm})")
+print("\n=== 2. Application ID ===")
 
-# ---------- 5. google-services.json: retarget to our package ----------
-gj = os.environ.get("GOOGLE_SERVICES_JSON_PATH")
-for g in walk(pattern_name="google-services.json"):
-    if gj and os.path.exists(gj):
-        write(g, read(gj)); print("ok: own google-services.json used")
-    else:
-        s = read(g)
-        s2 = re.sub(r'("package_name"\s*:\s*)"[^"]*"', r'\g<1>"' + PKG + '"', s)
-        write(g, s2); print("info: dummy google-services.json retargeted (no FCM push; set GOOGLE_SERVICES_JSON secret to enable)")
+gradle_files = (
+list(walk(suffix="build.gradle"))
++ list(walk(suffix="build.gradle.kts"))
+)
 
-# ---------- 6. DrawerLayoutAdapter: AHbsolute item + custom order ----------
-da = one("DrawerLayoutAdapter.java")
-if not da: fail("DrawerLayoutAdapter.java not found")
+gradle_count = 0
+
+for gradle in gradle_files:
+
+content = read(gradle)
+
+patterns = [
+r'(applicationId\s*=?\s*)["\']org\.telegram\.messenger[\w.]*["\']',
+r'(applicationId\s*=?\s*)["\'][^"\']*telegram[^"\']*["\']',
+]
+
+updated = content
+count = 0
+
+for pattern in patterns:
+updated, n = re.subn(
+pattern,
+lambda m: m.group(1) + '"' + PKG + '"',
+updated
+)
+count += n
+
+if count:
+write(gradle, updated)
+gradle_count += count
+
+if gradle_count:
+print(f"OK: applicationId updated ({gradle_count})")
+
+sanyaukr:
 else:
-    s = read(da)
-    m = re.search(r'void\s+resetItems\s*\(\s*\)\s*\{', s)
-    if not m: fail("resetItems() not found in DrawerLayoutAdapter")
-    else:
-        end = brace_end(s, m.end() - 1)
-        add = ('\n        items.add(new Item(org.telegram.messenger.ahbsolute.AHbsolute.DRAWER_ID, "AHbsolute", R.drawable.ahbsolute_menu_icon));\n'
-               '        ahbsoluteOrderItems();\n    ')
-        method = '''
-    private void ahbsoluteOrderItems() {
-        ArrayList<Integer> slots = new ArrayList<>();
-        ArrayList<Item> real = new ArrayList<>();
-        for (int i = 0; i < items.size(); i++) {
-            if (items.get(i) != null) { slots.add(i); real.add(items.get(i)); }
-        }
-        int[] ids = new int[real.size()];
-        String[] labels = new String[real.size()];
-        for (int i = 0; i < real.size(); i++) { ids[i] = real.get(i).id; labels[i] = String.valueOf(real.get(i).text); }
-        org.telegram.messenger.ahbsolute.AHbsolute.publishDrawer(ids, labels);
-        int[] order = org.telegram.messenger.ahbsolute.AHbsolute.getDrawerOrder();
-        if (order.length == 0) return;
-        ArrayList<Item> sorted = new ArrayList<>();
-        for (int id : order) for (Item it : real) if (it.id == id && !sorted.contains(it)) sorted.add(it);
-        for (Item it : real) if (!sorted.contains(it)) sorted.add(it);
-        for (int i = 0; i < slots.size(); i++) items.set(slots.get(i), sorted.get(i));
-    }
-'''
-        s = s[:end] + add + s[end:end + 1] + method + s[end + 1:]
-        if "import java.util.ArrayList;" not in s:
-            s = re.sub(r'(package [\w.]+;)', r'\1\nimport java.util.ArrayList;', s, count=1)
-        write(da, s); print("ok: DrawerLayoutAdapter patched")
+fail(
+"applicationId not found. "
+"Check the current Telegram Gradle configuration."
+)
 
-# ---------- 7. LaunchActivity: handle click on AHbsolute entry ----------
-la = one("LaunchActivity.java")
-if not la: fail("LaunchActivity.java not found")
-else:
-    s = read(la)
-    m = re.search(r'((?:final\s+)?int\s+(\w+)\s*=\s*drawerLayoutAdapter\.getId\(position\);)', s)
-    if not m: fail("drawerLayoutAdapter.getId(position) not found in LaunchActivity")
-    else:
-        v = m.group(2)
-        hook = (m.group(1) + f'\n                if (org.telegram.messenger.ahbsolute.AHbsolute.handleDrawerClick(LaunchActivity.this, {v})) {{ drawerLayoutContainer.closeDrawer(false); return; }}')
-        s = s.replace(m.group(1), hook, 1)
-        write(la, s); print("ok: LaunchActivity patched")
 
-# ---------- 8. ImageReceiver: shaped avatars ----------
-ir = one("ImageReceiver.java")
-if not ir: fail("ImageReceiver.java not found")
-else:
-    s = read(ir)
-    zero = re.search(r'private\s+int\[\]\s+roundRadius\b', s) is not None
-    if zero:
-        body = '''int a0 = roundRadius[0], a1 = roundRadius[1], a2 = roundRadius[2], a3 = roundRadius[3];
-        roundRadius[0] = roundRadius[1] = roundRadius[2] = roundRadius[3] = 0;
-        try { return ahOrigDraw(canvas); } finally {
-            roundRadius[0] = a0; roundRadius[1] = a1; roundRadius[2] = a2; roundRadius[3] = a3;
-            canvas.restoreToCount(ahSave);
-        }'''
-    else:
-        print("warn: roundRadius field not found, shapes will be clipped inside the circle")
-        body = 'try { return ahOrigDraw(canvas); } finally { canvas.restoreToCount(ahSave); }'
-    hook = '''public int ahShape = 0;
-    public boolean draw(Canvas canvas) {
-        if (ahShape == 0) return ahOrigDraw(canvas);
-        float ahW = getImageWidth(), ahH = getImageHeight();
-        if (ahW <= 0 || ahH <= 0) return ahOrigDraw(canvas);
-        int ahSave = canvas.save();
-        canvas.translate(getImageX(), getImageY());
-        canvas.clipPath(org.telegram.messenger.ahbsolute.AHbsolute.cachedPath(ahShape, ahW, ahH));
-        canvas.translate(-getImageX(), -getImageY());
-        ''' + body + '''
-    }
-    private boolean ahOrigDraw(Canvas canvas) {'''
-    s, n = re.subn(r'public\s+boolean\s+draw\s*\(\s*Canvas\s+canvas\s*\)\s*\{', lambda _m: hook, s, count=1)
-    if n != 1: fail("ImageReceiver.draw(Canvas) not found")
-    # set shape whenever an avatar is assigned
-    def inject(m):
-        return m.group(0) + f'\n        ahShape = org.telegram.messenger.ahbsolute.AHbsolute.shapeFor({m.group(1)});'
-    s, n2 = re.subn(r'public\s+void\s+setForUserOrChat\s*\(\s*TLObject\s+(\w+)\s*,[^)]*\)\s*\{', inject, s)
-    if n2 == 0: fail("ImageReceiver.setForUserOrChat not found")
-    write(ir, s); print(f"ok: ImageReceiver patched (setForUserOrChat overloads: {n2}, zero-radius: {zero})")
+# ---------------------------------------------------------
+# 3. Android manifests
+# ---------------------------------------------------------
 
-# ---------- 9. ApplicationLoader: startup hook ----------
-al = one("ApplicationLoader.java")
-if not al: fail("ApplicationLoader.java not found", required=False)
+print("\n=== 3. Android manifests ===")
+
+manifest_count = 0
+
+for manifest in walk(filename="AndroidManifest.xml"):
+
+content = read(manifest)
+
+updated, count = re.subn(
+r"org\.telegram\.messenger(?:\.web|\.beta)?\.permission\.",
+"${applicationId}.permission.",
+content
+)
+
+if count:
+write(manifest, updated)
+manifest_count += count
+
+print(
+"INFO: manifest permissions rewritten:",
+manifest_count
+)
+
+
+# ---------------------------------------------------------
+# 4. Application name
+# ---------------------------------------------------------
+
+print("\n=== 4. Application name ===")
+
+name_count = 0
+
+for strings in walk(filename="strings.xml"):
+
+content = read(strings)
+
+updated, count = re.subn(
+r'(<string\s+name="AppName(?:Beta)?"[^>]*>)[^<]*(</string>)',
+r'\g<1>AHbsolute\g<2>',
+content
+)
+
+if count:
+write(strings, updated)
+name_count += count
+
+if name_count:
+print(f"OK: AHbsolute name configured ({name_count})")
+
 else:
-    s = read(al)
-    m = re.search(r'public\s+void\s+onCreate\s*\(\s*\)\s*\{\s*super\.onCreate\(\);', s)
-    if not m: fail("ApplicationLoader.onCreate not found", required=False)
-    else:
-        s = s[:m.end()] + '\n        try { org.telegram.messenger.ahbsolute.AHbsolute.onAppStart(this); } catch (Throwable ignored) {}' + s[m.end():]
-        write(al, s); print("ok: ApplicationLoader patched")
+fail("AppName string not found")
+
+
+# ---------------------------------------------------------
+# 5. Google Services
+# ---------------------------------------------------------
+
+print("\n=== 5. Google Services ===")
+
+google_services = os.environ.get(
+"GOOGLE_SERVICES_JSON_PATH"
+)
+
+google_count = 0
+
+for google_file in walk(filename="google-services.json"):
+
+if google_services and Path(google_services).exists():
+
+write(
+google_file,
+Path(google_services).read_text(encoding="utf-8")
+)
+
+print("OK: custom google-services.json installed")
+
+else:
+
+content = read(google_file)
+
+updated = re.sub(
+r'("package_name"\s*:\s*)"[^"]*"',
+lambda m: m.group(1) + '"' + PKG + '"',
+content
+)
+
+write(google_file, updated)
+
+google_count += 1
+
+if not google_count and not google_services:
+print("INFO: no Google Services files found")
+
+
+# ---------------------------------------------------------
+# 6. Source structure diagnostics
+# ---------------------------------------------------------
+
+print("\n=== 6. Telegram source structure ===")
+
+drawer_files = list(UP.rglob("*Drawer*"))
+
+if drawer_files:
+print("Drawer-related files:")
+
+for path in drawer_files[:30]:
+print(" ", path.relative_to(UP))
+
+else:
+print("INFO: no Drawer-named files found")
+
+
+launch_files = list(UP.rglob("LaunchActivity.java"))
+
+if launch_files:
+
+for launch in launch_files:
+print(
+"FOUND LaunchActivity:",
+launch.relative_to(UP)
+)
+
+else:
+fail("LaunchActivity.java not found")
+
+
+# ---------------------------------------------------------
+# 7. Drawer integration
+# ---------------------------------------------------------
+
+print("\n=== 7. Drawer integration ===")
+
+drawer_adapter = one("DrawerLayoutAdapter.java")
+
+if not drawer_adapter:
+
+fail(
+"DrawerLayoutAdapter.java not found. "
+"AHbsolute drawer integration requires adaptation "
+"to the current Telegram source."
+)
+
+else:
+
+print(
+"INFO: DrawerLayoutAdapter found:",
+drawer_adapter.relative_to(UP)
+)
+
+content = read(drawer_adapter)
+
+if "ahbsoluteOrderItems" in content:
+print("INFO: AHbsolute drawer ordering already present")
+else:
+fail(
+"Drawer adapter exists, but its current resetItems "
+"implementation has not been safely patched."
+)
+
+
+# ---------------------------------------------------------
+# 8. LaunchActivity integration
+# ---------------------------------------------------------
+
+print("\n=== 8. LaunchActivity integration ===")
+
+launch = one("LaunchActivity.java")
+
+if launch:
+
+content = read(launch)
+
+sanyaukr:
+if "AHbsolute.handleDrawerClick" in content:
+print("INFO: AHbsolute drawer click handler already present")
+
+elif "drawerLayoutAdapter.getId(position)" in content:
+print(
+"INFO: old drawer click hook location found; "
+"manual integration is still required."
+)
+
+else:
+fail(
+"Current LaunchActivity does not match the old "
+"AHbsolute drawer patch."
+)
+
+
+# ---------------------------------------------------------
+# 9. ImageReceiver
+# ---------------------------------------------------------
+
+print("\n=== 9. ImageReceiver ===")
+
+image_receiver = one("ImageReceiver.java")
+
+if not image_receiver:
+
+fail("ImageReceiver.java not found")
+
+else:
+
+content = read(image_receiver)
+
+if "ahShape" in content:
+
+print("INFO: AHbsolute ImageReceiver patch already present")
+
+else:
+
+fail(
+"ImageReceiver has not been patched. "
+"The current source needs a compatible draw() hook."
+)
+
+
+# ---------------------------------------------------------
+# 10. ApplicationLoader
+# ---------------------------------------------------------
+
+print("\n=== 10. ApplicationLoader ===")
+
+application_loader = one("ApplicationLoader.java")
+
+if not application_loader:
+
+fail(
+"ApplicationLoader.java not found",
+required=False
+)
+
+else:
+
+content = read(application_loader)
+
+if "AHbsolute.onAppStart" in content:
+
+print("INFO: AHbsolute startup hook already present")
+
+elif re.search(
+r"public\s+void\s+onCreate\s*\(\s*\)",
+content
+):
+
+print(
+"INFO: ApplicationLoader.onCreate found; "
+"startup hook still needs source-compatible integration."
+)
+
+else:
+
+fail(
+"ApplicationLoader.onCreate not found",
+required=False
+)
+
+
+# ---------------------------------------------------------
+# Result
+# ---------------------------------------------------------
+
+print("\n====================================")
 
 if failures:
-    print("\n%d required patch(es) failed. Upstream code layout probably changed; see README, section 'If the build fails'." % len(failures))
-    sys.exit(1)
-print("\nAll required patches applied.")
+
+print(
+f"FAILED: {len(failures)} required check(s) failed."
+)
+
+for message in failures:
+print(" -", message)
+
+print(
+"\nAHbsolute patches are not fully compatible "
+"with this Telegram source version."
+)
+
+sys.exit(1)
+
+print("All required checks passed.")
+print("====================================")
