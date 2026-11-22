@@ -1,134 +1,153 @@
+sanyaukr:
 name: Build AHbsolute
 
 on:
-  workflow_dispatch:
-  push:
-    branches: [main, master]
+workflow_dispatch:
+push:
+branches: [main, master]
 
 jobs:
-  build:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 360
+build:
+runs-on: ubuntu-22.04
+timeout-minutes: 360
 
-    env:
-      TG_API_ID: ${{ secrets.TG_API_ID }}
-      TG_API_HASH: ${{ secrets.TG_API_HASH }}
-      AH_PACKAGE: com.ahbsolute.app
-      UPSTREAM_REF: master
+env:
+TG_API_ID: ${{ secrets.TG_API_ID }}
+TG_API_HASH: ${{ secrets.TG_API_HASH }}
+AH_PACKAGE: com.ahbsolute.app
+UPSTREAM_REF: master
 
-    steps:
-      - name: Checkout AHbsolute patches
-        uses: actions/checkout@v4
+steps:
+- name: Checkout AHbsolute patches
+uses: actions/checkout@v4
 
-      - name: Check Telegram API secrets
-        run: |
-          if [ -z "$TG_API_ID" ] || [ -z "$TG_API_HASH" ]; then
-            echo "::error::Add TG_API_ID and TG_API_HASH in repository secrets."
-            exit 1
-          fi
+- name: Check Telegram API secrets
+run: |
+if [ -z "$TG_API_ID" ] || [ -z "$TG_API_HASH" ]; then
+echo "::error::Add TG_API_ID and TG_API_HASH secrets."
+exit 1
+fi
 
-      - name: Checkout Telegram Android source
-        uses: actions/checkout@v4
-        with:
-          repository: TelegramMessenger/Telegram-Android
-          ref: ${{ env.UPSTREAM_REF }}
-          path: upstream
-          fetch-depth: 1
-          submodules: recursive
+- name: Checkout Telegram Android source
+uses: actions/checkout@v4
+with:
+repository: TelegramMessenger/Telegram-Android
+ref: ${{ env.UPSTREAM_REF }}
+path: upstream
+fetch-depth: 1
+submodules: recursive
 
-      - name: Set up Java 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 17
+- name: Diagnose Telegram source layout
+working-directory: upstream
+run: |
+echo "=== Gradle files ==="
+find . -maxdepth 3 \( -name "build.gradle" -o -name "build.gradle.kts" \)
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
+echo "=== Drawer files ==="
+find . -iname "*drawer*"
 
-      - name: Install Android SDK and NDK packages
-        run: |
-          yes | sdkmanager --licenses
-          sdkmanager --install \
-            "platforms;android-36" \
-            "build-tools;36.0.0" \
-            "ndk;27.2.12479018" \
-            "cmake;3.22.1"
+echo "=== LaunchActivity ==="
+find . -name "LaunchActivity.java"
 
-      - name: Install Python dependencies
-        run: |
-          python3 -m pip install pillow
+echo "=== Application ID declarations ==="
+grep -R -n "applicationId" \
+--include="*.gradle" \
+--include="*.gradle.kts" . | head -30 || true
 
-      - name: Optional Google Services
-        env:
-          GS: ${{ secrets.GOOGLE_SERVICES_JSON }}
-        run: |
-          if [ -n "$GS" ]; then
-            echo "$GS" > "$RUNNER_TEMP/gs.json"
-            echo "GOOGLE_SERVICES_JSON_PATH=$RUNNER_TEMP/gs.json" >> "$GITHUB_ENV"
-          fi
+- name: Set up Java 17
+uses: actions/setup-java@v4
+with:
+distribution: temurin
+java-version: 17
 
-      - name: Copy AHbsolute sources
-        run: |
-          cp -r overlay/. upstream/
+- name: Set up Android SDK
+uses: android-actions/setup-android@v4
 
-      - name: Apply AHbsolute patches
-        run: |
-          python3 scripts/apply_patches.py upstream
+- name: Install Android SDK and NDK
+run: |
+yes | sdkmanager --licenses
+sdkmanager --install \
+"platforms;android-36" \
+"build-tools;36.0.0" \
+"ndk;27.2.12479018" \
+"cmake;3.22.1"
 
-      - name: Replace launcher icons
-        run: |
-          python3 scripts/make_icons.py upstream
+- name: Install Python dependencies
+run: |
+python3 -m pip install pillow
 
-      - name: Configure optional release keystore
-        env:
-          KS: ${{ secrets.KEYSTORE_BASE64 }}
-          KP: ${{ secrets.KEYSTORE_PASSWORD }}
-          KA: ${{ secrets.KEY_ALIAS }}
-        run: |
-          if [ -n "$KS" ]; then
-            mkdir -p upstream/TMessagesProj/config
-            echo "$KS" | base64 -d > upstream/TMessagesProj/config/release.keystore
+- name: Optional Google Services
+env:
+GS: ${{ secrets.GOOGLE_SERVICES_JSON }}
+run: |
+if [ -n "$GS" ]; then
+echo "$GS" > "$RUNNER_TEMP/gs.json"
+echo "GOOGLE_SERVICES_JSON_PATH=$RUNNER_TEMP/gs.json" >> "$GITHUB_ENV"
+fi
 
-            {
-              echo "RELEASE_KEY_PASSWORD=$KP"
-              echo "RELEASE_KEY_ALIAS=$KA"
-              echo "RELEASE_STORE_PASSWORD=$KP"
-            } >> upstream/gradle.properties
-          else
-            echo "::warning::No custom keystore. Using upstream signing configuration."
-          fi
+- name: Copy AHbsolute sources
+run: |
+cp -r overlay/. upstream/
 
-      - name: Build AHbsolute Release APK
-        working-directory: upstream
-        run: |
-          chmod +x gradlew
+- name: Apply AHbsolute patches
+run: |
+python3 scripts/apply_patches.py upstream
 
-          if [ -d TMessagesProj_App ]; then
-            MODULE=TMessagesProj_App
-          else
-            MODULE=TMessagesProj
-          fi
+- name: Replace launcher icons
+run: |
+python3 scripts/make_icons.py upstream
 
-          echo "Gradle module: $MODULE"
+- name: Configure optional release keystore
+env:
+KS: ${{ secrets.KEYSTORE_BASE64 }}
+KP: ${{ secrets.KEYSTORE_PASSWORD }}
+KA: ${{ secrets.KEY_ALIAS }}
+run: |
+if [ -n "$KS" ]; then
+mkdir -p upstream/TMessagesProj/config
+echo "$KS" | base64 -d > upstream/TMessagesProj/config/release.keystore
 
-          TASK=$(./gradlew -q ":$MODULE:tasks" --all --no-daemon 2>/dev/null \
-            | grep -oE '^assemble[A-Za-z]*[Aa]fat[A-Za-z]*Release\b' \
-            | head -1 || true)
+{
+echo "RELEASE_KEY_PASSWORD=$KP"
+echo "RELEASE_KEY_ALIAS=$KA"
+echo "RELEASE_STORE_PASSWORD=$KP"
+} >> upstream/gradle.properties
+else
+echo "::warning::No custom keystore configured."
+fi
 
-          TASK=${TASK:-assembleRelease}
+- name: Build AHbsolute Release APK
+working-directory: upstream
+run: |
+chmod +x gradlew
 
-          echo "Building task: :$MODULE:$TASK"
+if [ -d TMessagesProj_App ]; then
+MODULE=TMessagesProj_App
+else
+MODULE=TMessagesProj
+fi
 
-          ./gradlew ":$MODULE:$TASK" \
-            --no-daemon \
-            --parallel \
-            --build-cache \
-            -Pandroid.injected.build.abi=arm64-v8a,armeabi-v7a \
-            -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g"
+echo "Gradle module: $MODULE"
 
-      - name: Upload AHbsolute APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: AHbsolute-apk
-          path: upstream//build/outputs/apk//*.apk
-          if-no-files-found: error
+TASK=$(./gradlew -q ":$MODULE:tasks" --all --no-daemon 2>/dev/null \
+| grep -oE '^assemble[A-Za-z]*[Aa]fat[A-Za-z]*Release\b' \
+| head -1 || true)
+
+TASK=${TASK:-assembleRelease}
+
+echo "Building task: :$MODULE:$TASK"
+
+sanyaukr:
+./gradlew ":$MODULE:$TASK" \
+--no-daemon \
+--parallel \
+--build-cache \
+-Pandroid.injected.build.abi=arm64-v8a,armeabi-v7a \
+-Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g"
+
+- name: Upload AHbsolute APK
+uses: actions/upload-artifact@v4
+with:
+name: AHbsolute-apk
+path: upstream//build/outputs/apk//*.apk
+if-no-files-found: error
