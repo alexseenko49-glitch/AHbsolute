@@ -1,0 +1,108 @@
+name: Build AHbsolute
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    env:
+      TG_API_ID: ${{ secrets.TG_API_ID }}
+      TG_API_HASH: ${{ secrets.TG_API_HASH }}
+      AH_PACKAGE: com.ahbsolute.app
+      UPSTREAM_REF: master
+
+    steps:
+      - name: Checkout AHbsolute patches
+        uses: actions/checkout@v4
+
+      - name: Require your own api_id
+        run: |
+          if [ -z "$TG_API_ID" ] || [ -z "$TG_API_HASH" ]; then
+            echo "::error::Add TG_API_ID and TG_API_HASH secrets."
+            exit 1
+          fi
+
+      - name: Checkout Telegram-Android
+        uses: actions/checkout@v4
+        with:
+          repository: TelegramMessenger/Telegram-Android
+          ref: ${{ env.UPSTREAM_REF }}
+          path: upstream
+          fetch-depth: 1
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        run: |
+          NDK=$(grep -rhoE 'ndkVersion\s*=?\s*"[0-9.]+"' upstream --include=build.gradle --include=build.gradle.kts | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
+          if [ -n "$NDK" ]; then
+            yes | sdkmanager "ndk;$NDK" || true
+          fi
+
+      - name: Python deps
+        run: pip install pillow
+
+      - name: Optional Google services
+        env:
+          GS: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          if [ -n "$GS" ]; then
+            echo "$GS" > "$RUNNER_TEMP/gs.json"
+            echo "GOOGLE_SERVICES_JSON_PATH=$RUNNER_TEMP/gs.json" >> "$GITHUB_ENV"
+          fi
+
+      - name: Copy AHbsolute sources
+        run: cp -r overlay/. upstream/
+
+      - name: Apply patches
+        run: python3 scripts/apply_patches.py upstream
+
+      - name: Replace launcher icons
+        run: python3 scripts/make_icons.py upstream
+
+      - name: Optional release keystore
+        env:
+          KS: ${{ secrets.KEYSTORE_BASE64 }}
+          KP: ${{ secrets.KEYSTORE_PASSWORD }}
+          KA: ${{ secrets.KEY_ALIAS }}
+        run: |
+          if [ -n "$KS" ]; then
+            mkdir -p upstream/TMessagesProj/config
+            echo "$KS" | base64 -d > upstream/TMessagesProj/config/release.keystore
+            {
+              echo "RELEASE_KEY_PASSWORD=$KP"
+              echo "RELEASE_KEY_ALIAS=$KA"
+              echo "RELEASE_STORE_PASSWORD=$KP"
+            } >> upstream/gradle.properties
+          else
+            echo "::warning::No keystore secret configured."
+          fi
+
+      - name: Build AHbsolute
+        working-directory: upstream
+        run: |
+          chmod +x gradlew
+          MODULE=$(ls -d TMessagesProj_App 2>/dev/null || echo TMessagesProj)
+          TASK=$(./gradlew -q ":$MODULE:tasks" --all --no-daemon 2>/dev/null | grep -oE '^assemble[A-Za-z]*[Aa]fat[A-Za-z]*Release\b' | head -1 || true)
+          TASK=${TASK:-assembleRelease}
+          echo "Gradle task: :$MODULE:$TASK"
+          ./gradlew ":$MODULE:$TASK" --no-daemon --parallel --build-cache \
+            -Pandroid.injected.build.abi=arm64-v8a,armeabi-v7a \
+            -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: AHbsolute-apk
+          path: upstream//build/outputs/apk//*.apk
+          if-no-files-found: error
