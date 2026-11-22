@@ -20,39 +20,45 @@ jobs:
       - name: Checkout AHbsolute patches
         uses: actions/checkout@v4
 
-      - name: Require your own api_id
+      - name: Check Telegram API secrets
         run: |
           if [ -z "$TG_API_ID" ] || [ -z "$TG_API_HASH" ]; then
-            echo "::error::Add TG_API_ID and TG_API_HASH secrets."
+            echo "::error::Add TG_API_ID and TG_API_HASH in repository secrets."
             exit 1
           fi
 
-      - name: Checkout Telegram-Android
+      - name: Checkout Telegram Android source
         uses: actions/checkout@v4
         with:
           repository: TelegramMessenger/Telegram-Android
           ref: ${{ env.UPSTREAM_REF }}
           path: upstream
           fetch-depth: 1
+          submodules: recursive
 
-      - uses: actions/setup-java@v4
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: 17
 
-      - uses: android-actions/setup-android@v3
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
 
-      - name: Install NDK
+      - name: Install Android SDK and NDK packages
         run: |
-          NDK=$(grep -rhoE 'ndkVersion\s*=?\s*"[0-9.]+"' upstream --include=build.gradle --include=build.gradle.kts | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
-          if [ -n "$NDK" ]; then
-            yes | sdkmanager "ndk;$NDK" || true
-          fi
+          yes | sdkmanager --licenses
+          sdkmanager --install \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;27.2.12479018" \
+            "cmake;3.22.1"
 
-      - name: Python deps
-        run: pip install pillow
+      - name: Install Python dependencies
+        run: |
+          python3 -m pip install pillow
 
-      - name: Optional Google services
+      - name: Optional Google Services
         env:
           GS: ${{ secrets.GOOGLE_SERVICES_JSON }}
         run: |
@@ -62,15 +68,18 @@ jobs:
           fi
 
       - name: Copy AHbsolute sources
-        run: cp -r overlay/. upstream/
+        run: |
+          cp -r overlay/. upstream/
 
-      - name: Apply patches
-        run: python3 scripts/apply_patches.py upstream
+      - name: Apply AHbsolute patches
+        run: |
+          python3 scripts/apply_patches.py upstream
 
       - name: Replace launcher icons
-        run: python3 scripts/make_icons.py upstream
+        run: |
+          python3 scripts/make_icons.py upstream
 
-      - name: Optional release keystore
+      - name: Configure optional release keystore
         env:
           KS: ${{ secrets.KEYSTORE_BASE64 }}
           KP: ${{ secrets.KEYSTORE_PASSWORD }}
@@ -79,28 +88,45 @@ jobs:
           if [ -n "$KS" ]; then
             mkdir -p upstream/TMessagesProj/config
             echo "$KS" | base64 -d > upstream/TMessagesProj/config/release.keystore
+
             {
               echo "RELEASE_KEY_PASSWORD=$KP"
               echo "RELEASE_KEY_ALIAS=$KA"
               echo "RELEASE_STORE_PASSWORD=$KP"
             } >> upstream/gradle.properties
           else
-            echo "::warning::No keystore secret configured."
+            echo "::warning::No custom keystore. Using upstream signing configuration."
           fi
 
-      - name: Build AHbsolute
+      - name: Build AHbsolute Release APK
         working-directory: upstream
         run: |
           chmod +x gradlew
-          MODULE=$(ls -d TMessagesProj_App 2>/dev/null || echo TMessagesProj)
-          TASK=$(./gradlew -q ":$MODULE:tasks" --all --no-daemon 2>/dev/null | grep -oE '^assemble[A-Za-z]*[Aa]fat[A-Za-z]*Release\b' | head -1 || true)
+
+          if [ -d TMessagesProj_App ]; then
+            MODULE=TMessagesProj_App
+          else
+            MODULE=TMessagesProj
+          fi
+
+          echo "Gradle module: $MODULE"
+
+          TASK=$(./gradlew -q ":$MODULE:tasks" --all --no-daemon 2>/dev/null \
+            | grep -oE '^assemble[A-Za-z]*[Aa]fat[A-Za-z]*Release\b' \
+            | head -1 || true)
+
           TASK=${TASK:-assembleRelease}
-          echo "Gradle task: :$MODULE:$TASK"
-          ./gradlew ":$MODULE:$TASK" --no-daemon --parallel --build-cache \
+
+          echo "Building task: :$MODULE:$TASK"
+
+          ./gradlew ":$MODULE:$TASK" \
+            --no-daemon \
+            --parallel \
+            --build-cache \
             -Pandroid.injected.build.abi=arm64-v8a,armeabi-v7a \
             -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g"
 
-      - name: Upload APK
+      - name: Upload AHbsolute APK
         uses: actions/upload-artifact@v4
         with:
           name: AHbsolute-apk
