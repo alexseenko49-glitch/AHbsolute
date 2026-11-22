@@ -1,4 +1,3 @@
-sanyaukr:
 #!/usr/bin/env python3
 
 """
