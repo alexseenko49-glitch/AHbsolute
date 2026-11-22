@@ -24,7 +24,7 @@ from pathlib import Path
 # ---------------------------------------------------------
 
 if len(sys.argv) < 2:
-print("Usage: apply_patches.py <upstream_dir>")
+    print("Usage: apply_patches.py <upstream_dir>")
 sys.exit(1)
 
 UP = Path(sys.argv[1]).resolve()
